@@ -1,22 +1,35 @@
-from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL
-from memory import (add_message, get_history, save_memory,
-                    get_memory_prompt, get_all_memories_text, delete_memory)
-from tools.calendar_tool import create_event
-from tools.search_tool import web_search as do_web_search, search_news
-from tools.gmail_tool import send_email, read_inbox, read_email_content
-from skill_loader import get_skills_prompt, get_skill_names
-from skill_executor import execute_skill
-from skill_writer import write_skill, list_skills, delete_skill, improve_skill
-from datetime import datetime
-from skill_loader import get_skills_prompt, get_skill_names, match_skill
+import glob
 import os
 import re
-import glob
-import time # Nambah time buat jeda retry
+import time  # Nambah time buat jeda retry
+from datetime import datetime
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
-OUTPUT_DIR = "/root/aiagent/output_office"
+from groq import Groq
+from tools.calendar_tool import create_event
+from tools.gmail_tool import read_email_content, read_inbox, send_email
+from tools.search_tool import search_news
+from tools.search_tool import web_search as do_web_search
+
+import auth
+from config import GROQ_API_KEY, GROQ_MODEL
+from logging_setup import get_logger
+from memory import add_message, delete_memory, get_all_memories_text, get_history, get_memory_prompt, save_memory
+from paths import BASE_DIR, OUTPUT_OFFICE_DIR, PLAYWRIGHT_COOKIES, TMP_DIR, ensure_runtime_dirs
+from paths import OUTPUT_DIR as _OUTPUT_DIR
+from skill_executor import execute_skill
+from skill_loader import get_skill_names, get_skills_prompt, match_skill
+from skill_writer import delete_skill, improve_skill, list_skills, write_skill
+
+logger = get_logger(__name__)
+ensure_runtime_dirs()
+
+# Path constants (resolved at import time, override via JAGRESMAN_HOME env var)
+SKILLS_DIR = str(BASE_DIR / "skills")
+OUTPUT_DIR = str(OUTPUT_OFFICE_DIR)
+BASE_DIR_STR = str(BASE_DIR)
+OUTPUTS_DIR_STR = str(_OUTPUT_DIR)
+TMP_DIR_STR = str(TMP_DIR)
+COOKIES_STR = str(PLAYWRIGHT_COOKIES)
 
 # API Keys rotation
 try:
@@ -59,7 +72,7 @@ def detect_action(text):
     for line in lines:
         clean_line = line.strip()
         line_upper = clean_line.upper()
-        
+
         if line_upper.startswith("SEARCH:"):
             return "SEARCH", clean_line[7:].strip()
         elif line_upper.startswith("NEWS:"):
@@ -90,19 +103,19 @@ def detect_action(text):
             return "CREATE_EXCEL", clean_line[13:].strip()
         elif line_upper.startswith("CREATE_WORD:"):
             return "CREATE_WORD", clean_line[12:].strip()
-            
+
         elif "EXECUTE_BASH:" in line_upper:
             idx = line_upper.find("EXECUTE_BASH:")
             return "EXECUTE_BASH", clean_line[idx + 13:].strip()
-            
+
         elif "EDIT_FILE:" in line_upper:
             idx = line_upper.find("EDIT_FILE:")
             return "EDIT_FILE", clean_line[idx + 10:].strip()
-            
+
         elif "SCREENSHOT:" in line_upper:
             idx = line_upper.find("SCREENSHOT:")
             return "SCREENSHOT", clean_line[idx + 11:].strip()
-            
+
         elif "SCREENSHOT_FULL:" in line_upper:
             idx = line_upper.find("SCREENSHOT_FULL:")
             return "SCREENSHOT_FULL", clean_line[idx + 16:].strip()
@@ -145,6 +158,49 @@ def detect_action(text):
 
     return None, None
 
+async def _run_bash_command(cmd: str, user_id: int, context=None) -> str:
+    """Run a shell command (sekarang setelah approval, atau auto-approved safe cmd).
+
+    Centralized di sini biar bisa dipanggil dari handler EXECUTE_BASH dan dari
+    callback approval di main.py (lewat `execute_approved_command`).
+    """
+    import subprocess
+
+    if context:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"🚀 Eksekusi Terminal: `{cmd}`...")
+        except Exception:
+            logger.exception("Failed to send 'eksekusi' notification")
+
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        output = res.stdout.strip() if res.returncode == 0 else res.stderr.strip()
+        if not output:
+            output = "✅ Eksekusi sukses (tidak ada output teks)."
+        bt = chr(96) * 3
+        logger.info("EXECUTE_BASH user_id=%s rc=%s cmd=%r", user_id, res.returncode, cmd)
+        return f"💻 Hasil `{cmd}`:\n{bt}bash\n{output[:3500]}\n{bt}"
+    except subprocess.TimeoutExpired:
+        logger.warning("EXECUTE_BASH timeout user_id=%s cmd=%r", user_id, cmd)
+        return f"⏱️ Timeout: `{cmd}` lebih dari 60 detik."
+    except Exception as e:
+        logger.exception("EXECUTE_BASH failed user_id=%s cmd=%r", user_id, cmd)
+        return f"❌ Gagal eksekusi Bash: {str(e)}"
+
+
+async def execute_approved_command(approval_id: str, user_id: int, context=None) -> str:
+    """Eksekusi command yang udah di-approve user lewat tombol Telegram.
+
+    Dipanggil dari callback handler di main.py. Kalau approval_id gak valid
+    (kadaluarsa atau bukan punya user ini), return error message.
+    """
+    record = auth.consume_pending_command(approval_id, user_id)
+    if record is None:
+        return "❌ Approval gak valid atau udah kadaluarsa (>10 menit). Jalanin ulang command-nya bro."
+    cmd = record["cmd"]
+    return await _run_bash_command(cmd, user_id, context)
+
+
 async def handle_file_delivery(user_id, context):
     """Mencari file terbaru di output_office dan mengirimkannya via Telegram"""
     if not context: return
@@ -152,7 +208,7 @@ async def handle_file_delivery(user_id, context):
         if not os.path.exists(OUTPUT_DIR): return
         files = glob.glob(os.path.join(OUTPUT_DIR, "*"))
         if not files: return
-        
+
         latest_file = max(files, key=os.path.getctime)
         if (datetime.now() - datetime.fromtimestamp(os.path.getctime(latest_file))).seconds < 45:
             with open(latest_file, 'rb') as f:
@@ -189,18 +245,18 @@ async def execute_matched_skill(skill_name: str, user_message: str, user_id: int
         if code.endswith("```"):
             code = code[:-3]
         code = code.strip()
-        
+
         # 🔥 FITUR BARU: Pastikan kode tidak kosong sebelum dieksekusi
         if not code:
             return f"❌ Skill '{skill_name}' gak punya kode yang bisa dijalain bro."
-            
+
         code = f"PESAN_USER = {repr(user_message)}\n" + code
 
         # Extract stock code
         stock_codes = re.findall(r'\b[A-Z]{2,7}\b', user_message.upper())
         kata_sampah = {
-            'TOLONG', 'ANALISA', 'ANALISIS', 'SEKARANG', 'PAKAI', 'MENGGUNAKAN', 
-            'SKILL', 'KOIN', 'SAHAM', 'CRYPTO', 'WAKTU', 'SAAT', 'WIB', 'INI', 
+            'TOLONG', 'ANALISA', 'ANALISIS', 'SEKARANG', 'PAKAI', 'MENGGUNAKAN',
+            'SKILL', 'KOIN', 'SAHAM', 'CRYPTO', 'WAKTU', 'SAAT', 'WIB', 'INI',
             'SISTEM', 'TANGGAL', 'JAM', 'DONG', 'COBA', 'KASIH', 'LIHAT', 'CEK',
             'HARI', 'MARKET', 'GOLD', 'FOREX', 'BUAT', 'YANG', 'DARI', 'PADA'
         }
@@ -211,10 +267,10 @@ async def execute_matched_skill(skill_name: str, user_message: str, user_id: int
         code = code.replace("kode = 'BBCA'", f"kode = '{stock_code}'")
 
         reply = execute_skill(skill_name, code)
-        
+
         if skill_name == "universal_office_engine":
             await handle_file_delivery(user_id, context)
-            
+
         return reply
 
     except Exception as e:
@@ -285,13 +341,13 @@ Gunakan CREATE_FILE untuk membuat file baru, SUPER_FIX untuk memperbaiki file di
 
 ATURAN KETAT MEMILIH FORMAT (DILARANG SALAH TANGKAP):
 1. HARAM MENGGUNAKAN SKILL JIKA USER MINTA EXCEL/TABEL!
-   Jika user mengetik "buatin excel", "bikin excel", "tabel", "spreadsheet", "rapihin data": WAJIB gunakan SKILL: universal_office_engine. 
+   Jika user mengetik "buatin excel", "bikin excel", "tabel", "spreadsheet", "rapihin data": WAJIB gunakan SKILL: universal_office_engine.
    Walaupun ada kata "forex", "crypto", "saham", TETAP GUNAKAN SKILL: universal_office_engine.
 2. JIKA user minta analisa, screening, atau cek market: BARU gunakan SKILL: <nama_skill>.
 
 ATURAN GOD MODE (VPS & KODE):
 1. Jika user minta info sistem, cek RAM, install library (pip), restart bot, atau urusan Linux lainnya -> WAJIB gunakan EXECUTE_BASH: <perintah>.
-2. Jika user minta mengubah, memperbaiki, atau menulis ulang kodingan di file tertentu -> WAJIB gunakan EDIT_FILE: /root/aiagent/<namafile> | <isi_kode_lengkap_tanpa_terpotong>.
+2. Jika user minta mengubah, memperbaiki, atau menulis ulang kodingan di file tertentu -> WAJIB gunakan EDIT_FILE: <path_file_absolut> | <isi_kode_lengkap_tanpa_terpotong>.
 3. SELF-HEALING: Jika user mengirimkan log ERROR Python atau Bash, analisa errornya, lalu gunakan EDIT_FILE atau EXECUTE_BASH untuk memperbaikinya secara otonom! Jika sebuah skill gagal dengan error API, coba gunakan SEARCH untuk mencari tahu mengapa API tersebut gagal atau gunakan DEBUG_CHAT untuk menganalisa kode skill tersebut.
 4. Jika user minta foto, ss, atau screenshot website/chart -> WAJIB SCREENSHOT: <url>
 5. Jika user menyuruh kamu untuk melakukan Retweet/Repost sebuah link Twitter, kamu DILARANG membalas dengan kalimat biasa. Kamu WAJIB merespon HANYA dengan format ini: AUTO_RETWEET: <url_tweet>
@@ -340,7 +396,7 @@ Pertanyaan biasa -> jawab normal santai pakai bahasa gaul, gunakan kata "lo/gua"
             # Jika respon sukses, pastikan ada isinya
             if not response or not response.choices or not response.choices[0].message.content:
                 raise Exception("Respon API kosong dari Groq.")
-                
+
             reply = response.choices[0].message.content.strip()
             break # Berhasil, keluar loop retry
         except Exception as e:
@@ -360,7 +416,7 @@ Pertanyaan biasa -> jawab normal santai pakai bahasa gaul, gunakan kata "lo/gua"
     if not reply and last_error:
         return f"❌ Semua API key ({total_keys}) gagal dieksekusi bro. Error terakhir: {str(last_error)}"
     elif not reply:
-        return f"❌ Terjadi error aneh, reply AI kosong tanpa log error bro."
+        return "❌ Terjadi error aneh, reply AI kosong tanpa log error bro."
 
     # ===============================================================
     # 🦖 FITUR BARU 3: TANGAN ROBOT (ANTI-ERROR REGEX)
@@ -369,22 +425,22 @@ Pertanyaan biasa -> jawab normal santai pakai bahasa gaul, gunakan kata "lo/gua"
     if bt in reply and "name:" in reply:
         pola_ekstrak = bt + r"(?:markdown|md)?\n(.*?)\n" + bt
         match_kodingan = re.search(pola_ekstrak, reply, re.DOTALL | re.IGNORECASE)
-        
+
         if match_kodingan:
             kodingan_bersih = match_kodingan.group(1).strip()
             match_nama = re.search(r'^name:\s*(.+)$', kodingan_bersih, re.MULTILINE)
-            
+
             if match_nama:
                 nama_folder = match_nama.group(1).strip().replace(" ", "_").lower()
                 path_folder = os.path.join(SKILLS_DIR, nama_folder)
-                
+
                 try:
                     os.makedirs(path_folder, exist_ok=True)
                     path_file = os.path.join(path_folder, "SKILL.md")
-                    
+
                     with open(path_file, "w", encoding="utf-8") as f:
                         f.write(kodingan_bersih)
-                        
+
                     pesan_sukses = (
                         f"\n\n✅ [SYSTEM] Tangan Robot Aktif!\n"
                         f"Skill [{nama_folder}] udah sukses dicetak ke VPS bosku!\n"
@@ -570,38 +626,63 @@ DILARANG:
     # Handler EXECUTE_BASH
     elif action == "EXECUTE_BASH":
         cmd = value.strip()
-        if context:
-            await context.bot.send_message(chat_id=user_id, text=f"🚀 Eksekusi Terminal: `{cmd}`...")
-        
-        import subprocess
-        try:
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
-            output = res.stdout.strip() if res.returncode == 0 else res.stderr.strip()
-            if not output:
-                output = "✅ Eksekusi sukses (tidak ada output teks)."
-            
-            bt = chr(96) * 3
-            reply = f"💻 Hasil `{cmd}`:\n{bt}bash\n{output[:3500]}\n{bt}"
-        except Exception as e:
-            reply = f"❌ Gagal eksekusi Bash: {str(e)}"
+        # Phase 0 security: dangerous commands need explicit user approval via Telegram button.
+        if auth.requires_approval(cmd):
+            classification = auth.classify_command(cmd)
+            approval_id = auth.record_pending_command(user_id, cmd)
+            logger.info(
+                "Queued EXECUTE_BASH for approval: user_id=%s risk=%s approval_id=%s cmd=%r",
+                user_id, classification.risk.value, approval_id, cmd,
+            )
+            if context:
+                try:
+                    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                    keyboard = InlineKeyboardMarkup(
+                        [[
+                            InlineKeyboardButton("✅ Approve", callback_data=f"bash_approve:{approval_id}"),
+                            InlineKeyboardButton("❌ Skip", callback_data=f"bash_skip:{approval_id}"),
+                        ]]
+                    )
+                    bt = chr(96) * 3
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"⚠️ Pending approval ({classification.risk.value.upper()}):\n"
+                            f"{bt}bash\n{cmd[:3500]}\n{bt}\n"
+                            f"Reason: {classification.reason}"
+                        ),
+                        reply_markup=keyboard,
+                    )
+                except Exception as send_err:
+                    logger.exception("Failed to send approval prompt: %s", send_err)
+            reply = "⚠️ Command lo perlu approval bro — cek tombol di chat."
+        else:
+            reply = await _run_bash_command(cmd, user_id, context)
+
+    # Handler EDIT_FILE — disabled di Phase 0 sampai approval flow buat file-writes selesai (Phase 1).
+    elif action == "EDIT_FILE":
+        reply = (
+            "⚠️ EDIT_FILE belum aktif di Phase 0. Approval flow buat file-write "
+            "masih dalam pengerjaan (Phase 1). Sementara, edit file manual atau pakai CREATE_FILE."
+        )
 
     # Handler SCREENSHOT (Biasa & Full)
     elif action in ["SCREENSHOT", "SCREENSHOT_FULL"]:
         url = value.strip()
         if not url.startswith("http"):
             url = "https://" + url
-            
+
         # OTOMATIS: Ubah twitter.com jadi x.com biar kuncinya pas!
         url = url.replace("twitter.com", "x.com")
-            
+
         is_full = "True" if action == "SCREENSHOT_FULL" else "False"
         tipe_ss = "Full Page" if action == "SCREENSHOT_FULL" else "Layar Biasa"
-            
+
         if context:
             await context.bot.send_message(chat_id=user_id, text=f"📸 Sabar bro, AI lagi jepret {url} (Mode: {tipe_ss})...")
-        
+
         import subprocess
-        
+
         script = f"""
 from playwright.sync_api import sync_playwright
 import time
@@ -610,57 +691,60 @@ import os
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True, 
+            headless=True,
             args=[
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled'
             ]
         )
-        
-        cookie_file = '/root/aiagent/playwright_cookies.json'
+
+        cookie_file = '{COOKIES_STR}'
         ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        
+
         # BIKIN SIMPEL: Kalau file cookies ada, sikat langsung pake!
         if os.path.exists(cookie_file):
             context = browser.new_context(
-                viewport={{'width': 1920, 'height': 1080}}, 
+                viewport={{'width': 1920, 'height': 1080}},
                 device_scale_factor=2,
                 storage_state=cookie_file,
                 user_agent=ua
             )
         else:
             context = browser.new_context(
-                viewport={{'width': 1920, 'height': 1080}}, 
+                viewport={{'width': 1920, 'height': 1080}},
                 device_scale_factor=2,
                 user_agent=ua
             )
-            
+
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}})")
-        
+
         page.goto('{url}', timeout=60000)
         time.sleep(10)  # Nunggu 10 detik biar tweetnya ke-load semua
-        
-        page.screenshot(path='/root/aiagent/outputs/ss.png', full_page={is_full})
+
+        page.screenshot(path='{OUTPUTS_DIR_STR}/ss.png', full_page={is_full})
         browser.close()
 except Exception as e:
     print("ERROR:", e)
 """
         try:
-            os.makedirs('/root/aiagent/outputs', exist_ok=True)
-            with open('/root/aiagent/tmp_ss.py', 'w') as f:
+            os.makedirs(OUTPUTS_DIR_STR, exist_ok=True)
+            os.makedirs(TMP_DIR_STR, exist_ok=True)
+            tmp_path = f"{TMP_DIR_STR}/tmp_ss.py"
+            screenshot_path = f"{OUTPUTS_DIR_STR}/ss.png"
+            with open(tmp_path, 'w') as f:
                 f.write(script)
-            
-            res = subprocess.run("python3.11 /root/aiagent/tmp_ss.py", shell=True, capture_output=True, text=True)
-            
-            if os.path.exists('/root/aiagent/outputs/ss.png'):
+
+            res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
+
+            if os.path.exists(screenshot_path):
                 if context:
-                    with open('/root/aiagent/outputs/ss.png', 'rb') as f:
+                    with open(screenshot_path, 'rb') as f:
                         await context.bot.send_photo(
-                            chat_id=user_id, 
-                            photo=f, 
+                            chat_id=user_id,
+                            photo=f,
                             caption=f"📸 Misi selesai! Ini visual dari {url}"
                         )
                 reply = f"✅ Screenshot {url} berhasil."
@@ -674,7 +758,7 @@ except Exception as e:
         url = value.strip().replace("twitter.com", "x.com")
         if not url.startswith("http"): url = "https://" + url
         if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 Hayu Like: {url}")
-        
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -682,15 +766,15 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
         page.goto('{url}', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         print("🔍 Mencari tombol Like...")
         like_btn = page.locator('[data-testid="like"]').first
         unlike_btn = page.locator('[data-testid="unlike"]').first
-        
+
         if unlike_btn.is_visible():
             print("✅ Udah di-Like sebelumnya bro! ❤️")
         elif like_btn.is_visible():
@@ -699,13 +783,15 @@ try:
             print("✅ SUKSES: Berhasil di Like ngab! ❤️")
         else:
             print("❌ GAGAL: Tombol Like ga ketemu bang.")
-            
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_like.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_like.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_like.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan AUTO_LIKE:\n{log_msg}")
 
@@ -714,7 +800,7 @@ except Exception as e:
         url = value.strip().replace("twitter.com", "x.com")
         if not url.startswith("http"): url = "https://" + url
         if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 dalam proses bang: {url}")
-        
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -722,21 +808,21 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
         page.goto('{url}', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         print("🔍 Mencari tombol Retweet...")
         unretweet_btn = page.locator('[data-testid="unretweet"]').first
         retweet_btn = page.locator('[data-testid="retweet"]').first
-        
+
         if unretweet_btn.is_visible():
             print("✅ Udah di-Repost sebelumnya bro! ♻️")
         elif retweet_btn.is_visible():
             retweet_btn.click(force=True)
-            time.sleep(2) 
-            
+            time.sleep(2)
+
             print("🔍 Mencari konfirmasi Repost...")
             confirm_btn = page.locator('[data-testid="retweetConfirm"]').first
             if confirm_btn.is_visible():
@@ -747,21 +833,23 @@ try:
                 print("❌ GAGAL: Tombol popup Repost ga ketemu bang.")
         else:
             print("❌ GAGAL: Tombol panah Retweet ga ketemu bang.")
-            
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_rt.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_rt.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_rt.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan AUTO_RETWEET:\n{log_msg}")
 
     # 3. Handler AUTO_POST
     elif action == "AUTO_POST":
         teks_post = value.strip()
-        if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 OTW nulis bang Tweetnya...")
-        
+        if context: await context.bot.send_message(chat_id=user_id, text="🤖 OTW nulis bang Tweetnya...")
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -769,11 +857,11 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
-        page.goto('[https://x.com/compose/tweet](https://x.com/compose/tweet)', timeout=60000, wait_until='domcontentloaded')
+        page.goto('https://x.com/compose/tweet', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         print("🔍 Mencari kotak ngetik...")
         textbox = page.locator('[data-testid="tweetTextarea_0"]').first
         if textbox.is_visible():
@@ -781,7 +869,7 @@ try:
             time.sleep(1)
             page.keyboard.type('''{teks_post}''', delay=50)
             time.sleep(2)
-            
+
             print("🔍 Mencari tombol Post...")
             post_btn = page.locator('[data-testid="tweetButton"]').first
             if post_btn.is_visible():
@@ -792,13 +880,15 @@ try:
                 print("❌ GAGAL: Tombol 'Post' ga ketemu bang.")
         else:
             print("❌ GAGAL: Kotak ngetik ga muncul bang.")
-            
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_post.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_post.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_post.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan AUTO_POST:\n{log_msg}")
 
@@ -809,8 +899,8 @@ except Exception as e:
         url = parts[0].strip().replace("twitter.com", "x.com")
         if not url.startswith("http"): url = "https://" + url
         teks_reply = parts[1].strip()
-        if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 On proces bang..")
-        
+        if context: await context.bot.send_message(chat_id=user_id, text="🤖 On proces bang..")
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -818,11 +908,11 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
         page.goto('{url}', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         print("🔍 Mencari kotak komentar inline...")
         textbox = page.locator('[data-testid="tweetTextarea_0"]').first
         if textbox.is_visible():
@@ -830,12 +920,12 @@ try:
             time.sleep(1)
             page.keyboard.type('''{teks_reply}''', delay=50)
             time.sleep(2)
-            
+
             print("🔍 Mencari tombol Reply...")
             reply_btn = page.locator('[data-testid="tweetButtonInline"]').first
             if not reply_btn.is_visible():
                 reply_btn = page.locator('[data-testid="tweetButton"]').first
-                
+
             if reply_btn.is_visible():
                 reply_btn.click(force=True)
                 time.sleep(6)
@@ -844,13 +934,15 @@ try:
                 print("❌ GAGAL: Tombol Reply gak ketemu bang.")
         else:
             print("❌ GAGAL: Kotak komentar ga ketemu bang.")
-            
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_reply.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_reply.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_reply.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan AUTO_REPLY:\n{log_msg}")
 
@@ -859,7 +951,7 @@ except Exception as e:
         url = value.strip().replace("twitter.com", "x.com")
         if not url.startswith("http"): url = "https://" + url
         if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 OTW Eksekusi COMBO (Like & Repost): {url}")
-        
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -867,16 +959,16 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
         page.goto('{url}', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         # --- PROSES 1: LIKE ---
         print("🔍 Mengeksekusi Like...")
         like_btn = page.locator('[data-testid="like"]').first
         unlike_btn = page.locator('[data-testid="unlike"]').first
-        
+
         if unlike_btn.is_visible():
             print("✅ LIKE: Udah di-Li sebelumnya bro! ❤️")
         elif like_btn.is_visible():
@@ -885,19 +977,19 @@ try:
             print("✅ LIKE: SUKSES nge-Like! ❤️")
         else:
             print("❌ LIKE: GAGAL, tombol Like ga ketemu.")
-            
+
         time.sleep(2) # Jeda nafas bentar
-        
+
         # --- PROSES 2: RETWEET ---
         print("🔍 Mengeksekusi Retweet...")
         unretweet_btn = page.locator('[data-testid="unretweet"]').first
         retweet_btn = page.locator('[data-testid="retweet"]').first
-        
+
         if unretweet_btn.is_visible():
             print("✅ RETWEET: Udah di-Repost sebelumnya bro! ♻️")
         elif retweet_btn.is_visible():
             retweet_btn.click(force=True)
-            time.sleep(2) 
+            time.sleep(2)
             confirm_btn = page.locator('[data-testid="retweetConfirm"]').first
             if confirm_btn.is_visible():
                 confirm_btn.click(force=True)
@@ -907,13 +999,15 @@ try:
                 print("❌ RETWEET: GAGAL, tombol popup Repost ga ketemu.")
         else:
             print("❌ RETWEET: GAGAL, tombol panah Retweet ga ketemu.")
-            
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_lrt.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_lrt.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_lrt.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan COMBO (Like + RT):\n{log_msg}")
 
@@ -922,7 +1016,7 @@ except Exception as e:
         url = value.strip().replace("twitter.com", "x.com")
         if not url.startswith("http"): url = "https://" + url
         if context: await context.bot.send_message(chat_id=user_id, text=f"🤖 OTW Follow akun: {url}")
-        
+
         import subprocess
         script = f"""
 from playwright.sync_api import sync_playwright
@@ -930,16 +1024,16 @@ import time
 try:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='/root/aiagent/playwright_cookies.json', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
+        context = browser.new_context(viewport={{'width': 1920, 'height': 1080}}, storage_state='{COOKIES_STR}', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0')
         page = context.new_page()
         page.goto('{url}', timeout=60000, wait_until='domcontentloaded')
         time.sleep(8)
-        
+
         print("🔍 Mencari tombol Follow...")
         # Trik nangkep tombol follow Twitter yang ID-nya dinamis
         unfollow_btn = page.locator('button[data-testid$="-unfollow"]').first
         follow_btn = page.locator('button[data-testid$="-follow"]').first
-        
+
         if unfollow_btn.is_visible():
             print("✅ Udah lu Follow sebelumnya bro! 🤝")
         elif follow_btn.is_visible():
@@ -954,13 +1048,15 @@ try:
                 print("✅ SUKSES: Berhasil nge-Follow (Alternatif)! 👤+")
             else:
                 print("❌ GAGAL: Tombol Follow ga ketemu.")
-                
+
         browser.close()
 except Exception as e:
     print(f"❌ CRASH: {{str(e)}}")
 """
-        with open('/root/aiagent/tmp_follow.py', 'w') as f: f.write(script)
-        res = subprocess.run("python3.11 /root/aiagent/tmp_follow.py", shell=True, capture_output=True, text=True)
+        os.makedirs(TMP_DIR_STR, exist_ok=True)
+        tmp_path = f"{TMP_DIR_STR}/tmp_follow.py"
+        with open(tmp_path, 'w') as f: f.write(script)
+        res = subprocess.run(f"python3.11 {tmp_path}", shell=True, capture_output=True, text=True)
         log_msg = f"{res.stdout.strip()}\n{res.stderr.strip()}".strip()
         if context: await context.bot.send_message(chat_id=user_id, text=f"📝 Laporan AUTO_FOLLOW:\n{log_msg}")
 
@@ -971,7 +1067,7 @@ except Exception as e:
             if context: await context.bot.send_message(chat_id=user_id, text="❌ Format: CREATE_FILE: nama.py | kodenya")
             return
         filename, code = parts[0].strip(), parts[1].strip()
-        filepath = f"/root/aiagent/{filename}"
+        filepath = os.path.join(BASE_DIR_STR, filename)
         try:
             with open(filepath, 'w') as f: f.write(code)
             if context: await context.bot.send_message(chat_id=user_id, text=f"✅ File `{filename}` berhasil dibuat!")
@@ -985,18 +1081,18 @@ except Exception as e:
             if context: await context.bot.send_message(chat_id=user_id, text="❌ Format: SUPER_FIX: file.py | errornya")
             return
         filename, error_msg = parts[0].strip(), parts[1].strip()
-        filepath = f"/root/aiagent/{filename}"
+        filepath = os.path.join(BASE_DIR_STR, filename)
         if not os.path.exists(filepath):
             if context: await context.bot.send_message(chat_id=user_id, text="❌ Filenya ga ada bro.")
             return
         with open(filepath, 'r') as f: broken_code = f.read()
         if context: await context.bot.send_message(chat_id=user_id, text=f"🏥 Lagi operasi bedah `{filename}`...")
-        
+
         prompt_fix = f"Tolong benerin kode ini agar tidak error: {error_msg}\n\nKODE:\n{broken_code}\n\nBerikan HANYA kode murni tanpa penjelasan."
         fixed_code = await run_agent(user_id, prompt_fix, context)
         # 🔥 FITUR BARU: Bersihkan kodingan dari markdown blok
         clean_code = fixed_code.replace("```python", "").replace("```", "").strip()
-        
+
         try:
             with open(filepath, 'w') as f: f.write(clean_code)
             if context: await context.bot.send_message(chat_id=user_id, text=f"✅ `{filename}` udah sehat & diketik ulang!")
@@ -1011,7 +1107,7 @@ except Exception as e:
             return
         user_err, user_code = parts[0].strip(), parts[1].strip()
         if context: await context.bot.send_message(chat_id=user_id, text="👨‍💻 AI lagi nganalisa kodingan lu...")
-        
+
         prompt_debug = f"User buntu ngoding. Error: {user_err}\nKode: {user_code}\nJelaskan singkat letak salahnya pakai bahasa santai 'bro' dan kasih kode benernya."
         answer = await run_agent(user_id, prompt_debug, context)
         if context: await context.bot.send_message(chat_id=user_id, text=f"🏥 ANALISA AI:\n\n{answer}", parse_mode="Markdown")
@@ -1042,8 +1138,8 @@ except Exception as e:
             # Extract stock code
             stock_codes = re.findall(r'\b[A-Z]{2,7}\b', user_message.upper())
             kata_sampah = {
-                'TOLONG', 'ANALISA', 'ANALISIS', 'SEKARANG', 'PAKAI', 'MENGGUNAKAN', 
-                'SKILL', 'KOIN', 'SAHAM', 'CRYPTO', 'WAKTU', 'SAAT', 'WIB', 'INI', 
+                'TOLONG', 'ANALISA', 'ANALISIS', 'SEKARANG', 'PAKAI', 'MENGGUNAKAN',
+                'SKILL', 'KOIN', 'SAHAM', 'CRYPTO', 'WAKTU', 'SAAT', 'WIB', 'INI',
                 'SISTEM', 'TANGGAL', 'JAM', 'DONG', 'COBA', 'KASIH', 'LIHAT', 'CEK',
                 'HARI', 'MARKET', 'GOLD', 'FOREX', 'BUAT', 'YANG', 'DARI', 'PADA'
             }
@@ -1081,7 +1177,7 @@ except Exception as e:
             code = f"PESAN_USER = {repr(user_message)}\n" + code
 
             reply = execute_skill(skill_name, code)
-            
+
             # 🔥 AUTO-SEND JIKA OFFICE ENGINE YANG JALAN 🔥
             if skill_name == "universal_office_engine":
                 await handle_file_delivery(user_id, context)

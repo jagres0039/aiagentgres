@@ -1,75 +1,86 @@
-# 🤖 Personal AI Agent
+# 🤖 Personal AI Agent (`aiagentgres`)
 
-Personal AI Agent berbasis Telegram Bot yang ditenagai Groq AI (Llama 3.3 70B).
-Dibangun dengan Python, terinspirasi dari OpenClaw AI Agent.
+Personal AI Agent berbasis Telegram + Groq AI (Llama 3.3 70B). Terinspirasi
+dari [Hermes Agent](https://hermes-agent.nousresearch.com/) by Nous Research
+(open-source self-improving AI agent — open-claw style).
+
+> **Status:** Phase 0 (security + refactor) — bot udah bisa di-deploy ke
+> production tanpa risiko shell injection. Fitur lanjutan (multi-platform
+> gateway, MCP, delegation) ada di Phase 1+ roadmap.
 
 ---
 
 ## 📁 Struktur Project
+
 ```
-/root/aiagent/
-├── main.py              # Entry point Telegram bot
-├── agent.py             # Logika utama + handler semua perintah
-├── config.py            # Konfigurasi API keys
-├── memory.py            # Memory persistent (SQLite)
-├── skill_loader.py      # Load semua skill otomatis
+aiagentgres/
+├── main.py              # Telegram entry point (allow-list, callback router)
+├── agent.py             # Core agent loop + action handlers
+├── config.py            # Env loader
+├── auth.py              # OWNER allow-list + dangerous-cmd approval
+├── paths.py             # Path resolution (JAGRESMAN_HOME override)
+├── logging_setup.py     # Logging config
+├── memory.py            # SQLite persistent memory
+├── skill_loader.py      # Load skills dari folder skills/
 ├── skill_executor.py    # Eksekusi kode dari skill
-├── skill_writer.py      # Self-improving — nulis skill sendiri
-├── knowledge.txt        # Pengetahuan manual tentang pemilik
-├── memory.db            # Database SQLite (auto-generated)
-├── .env                 # Secret keys (jangan di-commit!)
-├── credentials.json     # Google Calendar credentials
-├── service_account.json # Google Calendar service account
-├── token_gmail.json     # Gmail token (auto-generated)
-├── requirements.txt     # Dependencies
-├── tools/
-│   ├── calendar_tool.py # Google Calendar integration
-│   ├── gmail_tool.py    # Gmail SMTP integration
-│   └── search_tool.py   # Tavily web search
-└── skills/
-    ├── crypto/          # Cek harga crypto
-    ├── portfolio/       # Portfolio tracker
-    ├── weather/         # Cek cuaca
-    ├── news/            # Berita terbaru
-    ├── kurs/            # Kurs mata uang
-    ├── notes/           # Catatan
-    ├── translator/      # Translator
-    ├── summarizer/      # URL summarizer
-    └── [skill baru]/    # Ditambah otomatis
+├── skill_writer.py      # Self-improving — nulis skill sendiri via LLM
+├── morning_briefing.py  # Generator briefing pagi (jadwal cron jam 07:00 WIB)
+├── auto_trader.py       # Auto-trader Binance Futures (separate process)
+├── webhook_server.py    # TradingView webhook listener
+├── backtest*.py         # Backtest scripts
+├── knowledge.txt        # Fakta personal user (legacy, akan dipisah di Phase 1)
+├── AGENTS.md            # Project context (Hermes-style)
+├── SOUL.md              # Personality (Hermes-style)
+├── pyproject.toml       # Project metadata + dep list
+├── requirements.txt     # Pinned dependency versions
+├── .env.example         # Env var template
+├── .gitignore           # Hardening biar gak commit secret lagi
+├── tests/               # Pytest test suite
+│   ├── test_smoke.py
+│   └── test_auth.py
+└── .github/workflows/   # GitHub Actions CI (ruff + pytest)
 ```
+
+> **Catatan path:** Default `BASE_DIR` = direktori repo. Override pakai env
+> var `JAGRESMAN_HOME` kalau lo butuh deploy di luar VPS produksi
+> (`/root/aiagent/` udah gak hardcoded lagi).
 
 ---
 
-## ⚙️ Setup & Installation
+## ⚙️ Setup
 
-### 1. Clone & masuk folder
+### 1. Clone & install
 ```bash
-cd /root/aiagent
+git clone https://github.com/jagres0039/aiagentgres.git
+cd aiagentgres
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. Install dependencies
+### 2. Setup `.env`
 ```bash
-pip3 install python-telegram-bot groq python-dotenv \
-    google-auth google-auth-oauthlib google-api-python-client \
-    tavily-python ddgs pymupdf python-docx openpyxl aiosqlite
+cp .env.example .env
+# Edit .env, isi setidaknya TELEGRAM_BOT_TOKEN, GROQ_API_KEY, OWNER_TELEGRAM_IDS
 ```
 
-### 3. Setup `.env`
-```env
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-GROQ_API_KEY=your_groq_api_key
-TAVILY_API_KEY=your_tavily_api_key
-GMAIL_ADDRESS=your_gmail@gmail.com
-GMAIL_APP_PASSWORD=your_16digit_app_password
+### 3. Setup `OWNER_TELEGRAM_IDS` (WAJIB)
+Cari user ID lo dengan chat ke `@userinfobot` di Telegram. Lalu set:
 ```
+OWNER_TELEGRAM_IDS=123456789
+```
+Multi-owner: `OWNER_TELEGRAM_IDS=123,456,789`. **Kalau env ini kosong, bot
+bakal reject semua pesan**.
 
-### 4. Setup `knowledge.txt`
+### 4. (Optional) Setup `knowledge.txt`
 ```
 === TENTANG PEMILIK AGENT ===
 Nama: [nama lo]
 Kota: Bandung, Indonesia
 Timezone: WIB (UTC+7)
 ```
+
+Untuk personality dan project context, edit `SOUL.md` dan `AGENTS.md`.
 
 ### 5. Jalanin bot
 ```bash
@@ -78,221 +89,137 @@ python3.11 main.py
 
 ---
 
-## 🚀 Fitur
+## 🔒 Security Model (Phase 0)
 
-### Core
-| Fitur | Status | Keterangan |
-|---|---|---|
-| Telegram Bot | ✅ | Interface utama |
-| Groq AI (Llama 3.3 70B) | ✅ | Otak agent |
-| Memory Persistent | ✅ | SQLite, ingat walau restart |
-| Voice Note | ✅ | Whisper transcription |
-| Baca File | ✅ | PDF, Word, Excel |
-| Knowledge Base | ✅ | knowledge.txt |
+### Allow-list
+Setiap handler Telegram di `main.py` dibungkus `@require_owner`. User yang
+gak ada di `OWNER_TELEGRAM_IDS` di-reject sebelum agent dipanggil. Sebelum
+Phase 0, hanya `EXECUTE_BASH` yang punya owner check di dalam agent.py — tapi
+action lain (SKILL, SCREENSHOT, AUTO_*) bisa ditrigger LLM dari pesan user
+sembarangan. Sekarang gak bisa.
 
-### Tools
-| Tool | Status | Keterangan |
-|---|---|---|
-| Web Search | ✅ | Tavily API |
-| News Search | ✅ | Tavily news |
-| Google Calendar | ✅ | Service Account |
-| Gmail | ✅ | SMTP App Password |
+### Dangerous-command approval
+Setiap LLM-output `EXECUTE_BASH: ...` lewat classifier (lihat `auth.py`):
 
-### Skills System (OpenClaw style)
-| Skill | Status | Keterangan |
-|---|---|---|
-| Crypto Price | ✅ | CoinGecko API |
-| Portfolio Tracker | ✅ | Multi-coin |
-| Weather | ✅ | wttr.in |
-| News Crypto | ✅ | CryptoPanic |
-| Kurs Mata Uang | ✅ | Realtime |
-| Translator | ✅ | Google Translate |
-| URL Summarizer | ✅ | Extract & summarize |
-| Note Taking | ✅ | Simpan catatan |
-| Self-improving | ✅ | Nulis skill sendiri |
+| Risk | Behavior |
+|---|---|
+| `safe` (ls, df, free, uptime, ...) | Auto-run kalau `AUTO_APPROVE_SAFE_COMMANDS=true` (default) |
+| `moderate` (git push, pip install, kill, ...) | Tombol Approve/Skip di Telegram |
+| `dangerous` (rm -rf, sudo, curl \| bash, ...) | Tombol Approve/Skip di Telegram |
+
+Approval lewat tombol di Telegram dengan `InlineKeyboardButton`. Pending
+approval timeout di 10 menit. Cross-user attack diblok — user lain gak bisa
+nge-approve command yang di-trigger user A.
+
+`EDIT_FILE` di-disable sementara di Phase 0 sampai approval flow buat
+file-write selesai (Phase 1).
+
+### File hygiene
+`.env`, `*.db`, `*.log`, `service_account.json`, `playwright_cookies.json`,
+`tmp_*.py`, `__pycache__/` semua di-ignore dari git. Kalau lo upgrade dari
+versi sebelum Phase 0, **jangan force-push** — file lama di history-nya udah
+gua hapus dari latest commit, tapi history-nya tetep ada (lo perlu revoke
+session Twitter/X manual kalau pernah commit cookie).
+
+---
+
+## 🧪 Test & Lint
+
+```bash
+pip install -e ".[dev]"        # install ruff + pytest
+ruff check .                   # lint
+pytest                         # unit tests
+```
+
+CI otomatis jalanin keduanya di GitHub Actions tiap push & PR (`.github/workflows/ci.yml`).
 
 ---
 
 ## 💬 Cara Pakai
 
-### Commands Telegram
+### Commands
 ```
-/start   - Mulai bot
-/clear   - Hapus history chat
-/memory  - Lihat semua memory tersimpan
+/start    - Halo
+/clear    - Hapus history chat
+/memory   - Lihat semua memory tersimpan
+/briefing - Trigger morning briefing manual
+/mode     - Switch trading mode (scalping / swing)
 ```
 
-### Contoh Perintah
+### Contoh perintah natural
 ```
-# Web Search
 "cariin info terbaru soal Bitcoin"
-"berita crypto hari ini"
-
-# Calendar
-"buat event meeting besok jam 10 pagi sampai jam 11"
-"ingetin gua besok jam 3 sore"
-
-# Email
+"buat event meeting besok jam 10 sampai jam 11"
 "cek inbox gua"
-"kirimin email ke xxx@gmail.com subject Test isi: Halo!"
-"baca email pertama"
-
-# Crypto
 "berapa harga BTC sekarang?"
-"cek portfolio gua"
-"fear and greed index sekarang?"
-
-# Skill Management
 "buatin skill buat cek jadwal sholat"
-"lihat semua skill yang ada"
-"improve skill crypto biar tampilin market cap juga"
-"hapus skill xxx"
-
-# Memory
 "inget ini: gua biasanya trading jam 9 malem"
-/memory
-"lupain soal xxx"
-
-# File
-# Upload PDF/Word/Excel → bot langsung baca & analisis
-# Upload dengan caption "analisis data ini" → bot analisis sesuai perintah
-
-# Voice Note
-# Kirim VN → bot transcribe & proses otomatis
+"screenshot https://example.com"
+"like https://x.com/some/tweet"
 ```
 
----
-
-## 🧠 Skills System
-
-Skills disimpan di folder `skills/` — setiap skill punya `SKILL.md` berisi instruksi untuk AI.
-
-### Tambah Skill Manual
-```bash
-mkdir -p /root/aiagent/skills/nama_skill
-nano /root/aiagent/skills/nama_skill/SKILL.md
-```
-
-### Tambah Skill via Telegram
-```
-"buatin skill buat [deskripsi]"
-```
-
-### Format SKILL.md
-```markdown
-## Skill: Nama Skill
-
-### Deskripsi
-Apa yang skill ini lakukan.
-
-### Trigger
-Kapan skill ini dipanggil.
-
-### Cara Pakai
-SKILL: nama_skill
-CODE:
-import requests
-# kode python di sini
-print("output")
-```
+Upload PDF/Word/Excel → bot baca & analisis.
+Voice note → bot transcribe (Whisper) & proses.
 
 ---
 
 ## 🗺️ Roadmap
 
-### ✅ Done
-- Telegram Bot + Groq AI
-- Google Calendar
-- Web Search (Tavily)
-- News Search
-- Skills System (OpenClaw style)
-- Voice Note (Whisper)
-- Baca PDF, Word, Excel
-- Knowledge base personal
-- Gmail (kirim & baca)
-- Memory Persistent (SQLite)
-- Self-improving Agent
+### ✅ Phase 0 — Security & refactor (current PR)
+- [x] OWNER_TELEGRAM_IDS allow-list (multi-owner support)
+- [x] Dangerous-command approval flow via Telegram buttons
+- [x] Replace `/root/aiagent/` hardcoded paths dengan `BASE_DIR`
+- [x] `pyproject.toml` + `requirements.txt` (pinned)
+- [x] `.env.example`, `AGENTS.md`, `SOUL.md` Hermes-style
+- [x] Proper logging (`logging_setup.py`)
+- [x] `.gitignore` hardening + remove `.env`/`*.db`/`*.log`/cookies dari tracked files
+- [x] GitHub Actions CI (ruff + pytest)
+- [x] Smoke tests + auth tests
 
-### ⏳ Next
-- [ ] Morning Briefing otomatis
-- [ ] Price Alert crypto
-- [ ] Scheduler/Cron otomatis
-- [ ] Browser automation (Playwright)
-- [ ] Airdrop automation
-- [ ] Wallet balance checker
-- [ ] Trading agent
-- [ ] Google Sheets integration
-- [ ] Multi-agent system
+### 🔧 Phase 1 — Core Hermes parity (next)
+- [ ] Gateway abstraction (Telegram + Discord + Email skeleton)
+- [ ] Sessions (resumable, FTS5 search)
+- [ ] Profiles (switch persona on the fly)
+- [ ] Natural-language cron (replace hardcoded scheduler)
+- [ ] Structured action dispatcher (replace string parsing)
+- [ ] Skill curator + auto-improve
+- [ ] Provider abstraction (Groq / OpenAI / Anthropic / Ollama)
+- [ ] Browser tool refactor (drop inline subprocess script string)
+- [ ] EDIT_FILE re-enabled dengan approval flow
 
----
+### ⚡ Phase 2 — Power features
+- [ ] Delegation / subagents (parallel isolated work)
+- [ ] Persistent goals (Ralph loop)
+- [ ] MCP client
+- [ ] Image generation tool
+- [ ] TTS output
+- [ ] Plugin system + hooks
+- [ ] API server (OpenAI-compatible)
 
-## 🔧 Troubleshooting
-
-### Bot tidak response
-```bash
-python3.11 main.py
-# Cek error di terminal
-```
-
-### Restart bot
-```bash
-# Ctrl+C untuk stop
-python3.11 main.py
-```
-
-### Cek semua file
-```bash
-ls -la /root/aiagent/
-ls -la /root/aiagent/skills/
-ls -la /root/aiagent/tools/
-```
-
-### Backup project
-```bash
-tar -czf aiagent_backup_$(date +%Y%m%d).tar.gz /root/aiagent/
-```
-
-### Reset memory
-```bash
-rm /root/aiagent/memory.db
-python3.11 main.py
-```
+### 🚀 Phase 3 — Niche (optional)
+- [ ] Docker sandbox untuk EXECUTE_BASH
+- [ ] Git worktree multi-agent
+- [ ] Kanban task board
+- [ ] Batch processing
+- [ ] Local Ollama provider
 
 ---
 
-## 📦 Dependencies
-```
-python-telegram-bot==20.6
-groq==1.1.1
-python-dotenv==1.2.1
-tavily-python
-ddgs
-google-auth
-google-auth-oauthlib
-google-api-python-client
-pymupdf
-python-docx
-openpyxl
-aiosqlite
-requests
-```
+## 🔑 API Keys
 
----
-
-## 🔑 API Keys yang Dibutuhkan
-
-| Service | Link Daftar | Harga |
+| Service | Daftar | Harga |
 |---|---|---|
-| Telegram Bot | @BotFather di Telegram | Gratis |
-| Groq AI | console.groq.com | Gratis |
-| Tavily Search | tavily.com | Gratis (1000/bln) |
-| Google Calendar | console.cloud.google.com | Gratis |
-| Gmail App Password | myaccount.google.com/apppasswords | Gratis |
+| Telegram Bot | `@BotFather` di Telegram | Free |
+| Groq AI | console.groq.com | Free |
+| Tavily Search | tavily.com | Free (1000/bln) |
+| Google Calendar | console.cloud.google.com | Free |
+| Gmail App Password | myaccount.google.com/apppasswords | Free |
+| Binance Futures | binance.com (opsional, untuk auto-trader) | Free |
+| Alpha Vantage | alphavantage.co (opsional) | Free |
 
 ---
 
 ## 👤 Author
 
-Dibuat dengan ❤️ jagresman(eki)
-Kota: Bandung, Indonesia
-Terinspirasi dari: OpenClaw AI Agent
+Dibuat oleh jagresman (eki) — Bandung, Indonesia.
+Terinspirasi dari [Hermes Agent](https://hermes-agent.nousresearch.com/) by Nous Research.

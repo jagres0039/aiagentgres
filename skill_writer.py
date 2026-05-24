@@ -1,8 +1,11 @@
 import os
-from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
+from groq import Groq
+
+from config import GROQ_API_KEY, GROQ_MODEL
+from paths import SKILLS_DIR as _SKILLS_DIR
+
+SKILLS_DIR = str(_SKILLS_DIR)
 client = Groq(api_key=GROQ_API_KEY)
 
 def write_skill(skill_name: str, description: str) -> str:

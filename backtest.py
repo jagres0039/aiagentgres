@@ -1,8 +1,12 @@
+import os
 import sys
-sys.path.insert(0, '/root/aiagent')
-import requests
+from pathlib import Path
+
+# Make sibling modules importable. JAGRESMAN_HOME overrides default.
+sys.path.insert(0, os.getenv("JAGRESMAN_HOME") or str(Path(__file__).resolve().parent))
+
 import pandas as pd
-from datetime import datetime
+import requests
 
 # ==========================================
 # CONFIG BACKTEST
@@ -106,7 +110,6 @@ def backtest(symbol: str) -> dict:
         # Simulasi exit — cek candle berikutnya sampai kena SL/TP
         result = "RUNNING"
         exit_price = None
-        exit_idx = None
 
         for j in range(i+1, min(i+50, len(df))):
             future = df.iloc[j]
@@ -114,23 +117,19 @@ def backtest(symbol: str) -> dict:
                 if future['l'] <= sl:
                     result = "LOSS"
                     exit_price = sl
-                    exit_idx = j
                     break
                 elif future['h'] >= tp:
                     result = "WIN"
                     exit_price = tp
-                    exit_idx = j
                     break
             else:  # SHORT
                 if future['h'] >= sl:
                     result = "LOSS"
                     exit_price = sl
-                    exit_idx = j
                     break
                 elif future['l'] <= tp:
                     result = "WIN"
                     exit_price = tp
-                    exit_idx = j
                     break
 
         if result == "RUNNING":
@@ -139,7 +138,7 @@ def backtest(symbol: str) -> dict:
         # Kalkulasi PnL
         jarak_sl_pct = abs(entry - sl) / entry * 100
         resiko_usd = modal * (RESIKO_PERSEN / 100)
-        position_size = resiko_usd / (jarak_sl_pct / 100) if jarak_sl_pct > 0 else 0
+        resiko_usd / (jarak_sl_pct / 100) if jarak_sl_pct > 0 else 0
 
         if result == "WIN":
             pnl = resiko_usd * LEVERAGE
@@ -193,7 +192,7 @@ def backtest(symbol: str) -> dict:
 # ==========================================
 def run_backtest():
     print(f"\n{'='*50}")
-    print(f"  GODZILLA BACKTEST ENGINE")
+    print("  GODZILLA BACKTEST ENGINE")
     print(f"  Mode: {TRADING_MODE.upper()} | TF: {TIMEFRAME}")
     print(f"  Modal: ${TOTAL_MODAL} | Risk: {RESIKO_PERSEN}%")
     print(f"  Leverage: {LEVERAGE}x")
@@ -232,7 +231,7 @@ def run_backtest():
         avg_wr = sum(r['win_rate'] for r in all_results) / len(all_results)
 
         print(f"\n{'='*50}")
-        print(f"  SUMMARY SEMUA PAIRS")
+        print("  SUMMARY SEMUA PAIRS")
         print(f"{'='*50}")
         print(f"  Total Trade : {total_trades}")
         print(f"  Total Win   : {total_wins}")
