@@ -33,5 +33,19 @@ memory, skill auto-creation, dan safe code execution.
 
 - DO: tambah skill di `skills/<nama>/SKILL.md` dengan YAML frontmatter.
 - DO: pakai env var (lewat `config.py`) untuk credential, jangan hardcode.
+- DO: persistent history & search lewat `sessions.py` API (jangan langsung
+  query tabel `messages` / `messages_fts`).
+- DO: untuk platform messaging baru (Discord/Email/dll), inherit
+  `gateways.base.Gateway` — jangan tulis platform logic di `agent.py`.
 - DON'T: commit `.env`, `*.db`, `*.log`, cookie jar, atau service-account key.
 - DON'T: ubah `agent_backup.py` (legacy, akan dihapus di Phase 1 refactor).
+
+## Modul utama
+
+- `sessions.py` — conversation store dengan FTS5. Public API:
+  `get_or_create_active_session`, `append_message`, `get_messages`,
+  `search_messages`, `list_sessions`, `close_session`.
+- `memory.py` — thin adapter buat back-compat (`add_message`, `get_history`,
+  `clear_history`). Long-term `save_memory`/`get_memory` tetep di sini.
+- `gateways/` — platform abstraction. `Gateway` ABC + `TelegramGateway` +
+  `StubGateway` (testing).

@@ -1,26 +1,35 @@
+"""Memory store untuk aiagentgres.
+
+Phase 1: conversation history & search di-handle `sessions.py`. Modul ini
+jadi thin adapter biar kode lama (agent.py, skills) tetep bisa pake API
+`add_message` / `get_history` / `clear_history` tanpa kebanyakan rewrite.
+
+Long-term memory (fakta tentang user) tetep di tabel `long_term_memory` —
+bukan bagian dari sessions, karena scope-nya per-user bukan per-conversation.
+"""
+
+from __future__ import annotations
+
 import sqlite3
 
+import sessions  # bootstraps sessions/messages/FTS5 schema on import
+from logging_setup import get_logger
 from paths import DB_PATH as _DB_PATH
 
+logger = get_logger(__name__)
 DB_PATH = str(_DB_PATH)
+MAX_HISTORY = 20
 
-def init_db():
+
+def _init_long_term_tables() -> None:
+    """Bikin tabel long_term_memory & preferences (kalau belum ada).
+
+    Sessions schema di-init oleh `sessions.init_db()` saat sessions diimport.
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    # Tabel conversation history
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    # Tabel long term memory (fakta tentang user)
-    cursor.execute('''
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS long_term_memory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -29,10 +38,10 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, key)
         )
-    ''')
-
-    # Tabel user preferences
-    cursor.execute('''
+        """
+    )
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS preferences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -40,158 +49,137 @@ def init_db():
             value TEXT NOT NULL,
             UNIQUE(user_id, key)
         )
-    ''')
-
-    conn.commit()
-    conn.close()
-
-# Inisialisasi DB saat import
-init_db()
-
-MAX_HISTORY = 20
-
-def add_message(user_id: int, role: str, content: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        'INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)',
-        (user_id, role, content)
+        """
     )
-
-    # Hapus history lama kalau udah lebih dari MAX_HISTORY
-    cursor.execute('''
-        DELETE FROM conversations
-        WHERE user_id = ? AND id NOT IN (
-            SELECT id FROM conversations
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        )
-    ''', (user_id, user_id, MAX_HISTORY))
-
     conn.commit()
     conn.close()
 
-def get_history(user_id: int) -> list:
+
+_init_long_term_tables()
+
+
+def init_db() -> None:
+    """Back-compat alias. Modules lama nge-call ini buat ensure schema."""
+    _init_long_term_tables()
+    sessions.init_db()
+
+
+def _session_id_for(user_id: int, platform: str = "telegram") -> int:
+    """Ambil session aktif untuk user, atau bikin baru."""
+    return sessions.get_or_create_active_session(user_id, platform=platform).id
+
+
+def add_message(user_id: int, role: str, content: str) -> None:
+    """Append message ke session aktif user. Sesuai signature lama."""
+    session_id = _session_id_for(user_id)
+    sessions.append_message(session_id, role, content)
+    # Trim: di Hermes, sessions gak auto-trim — kita simpan semua history,
+    # tapi `get_history` cuma return MAX_HISTORY terakhir.
+
+
+def get_history(user_id: int) -> list[dict]:
+    """Return history sebagai list of {"role", "content"} (chronological)."""
+    session_id = _session_id_for(user_id)
+    msgs = sessions.get_messages(session_id, limit=MAX_HISTORY)
+    return [{"role": m.role, "content": m.content} for m in msgs]
+
+
+def clear_history(user_id: int) -> None:
+    """Hapus messages di session aktif (tapi session record itu sendiri tetep)."""
+    session_id = _session_id_for(user_id)
+    sessions.clear_messages(session_id)
+
+
+def save_memory(user_id: int, key: str, value: str) -> None:
+    """Simpan fakta penting tentang user (long-term)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    cursor.execute('''
-        SELECT role, content FROM conversations
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    ''', (user_id, MAX_HISTORY))
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    # Balik urutan biar chronological
-    return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
-
-def clear_history(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM conversations WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def save_memory(user_id: int, key: str, value: str):
-    """Simpan fakta penting tentang user"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
+    cursor.execute(
+        """
         INSERT OR REPLACE INTO long_term_memory (user_id, key, value, timestamp)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (user_id, key, value))
+        """,
+        (user_id, key, value),
+    )
     conn.commit()
     conn.close()
 
-def get_memory(user_id: int) -> dict:
-    """Ambil semua memory tentang user"""
+
+def get_memory(user_id: int) -> dict[str, str]:
+    """Ambil semua memory tentang user."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        'SELECT key, value FROM long_term_memory WHERE user_id = ?',
-        (user_id,)
+        "SELECT key, value FROM long_term_memory WHERE user_id = ?",
+        (user_id,),
     )
     rows = cursor.fetchall()
     conn.close()
     return {row[0]: row[1] for row in rows}
 
+
 def get_memory_prompt(user_id: int) -> str:
-    """Generate prompt dari long term memory"""
+    """Generate system prompt dari long term memory."""
     memories = get_memory(user_id)
     if not memories:
         return ""
-
     prompt = "Yang lo tau tentang user ini:\n"
     for key, value in memories.items():
         prompt += f"- {key}: {value}\n"
     return prompt
 
-def save_preference(user_id: int, key: str, value: str):
-    """Simpan preferensi user"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO preferences (user_id, key, value)
-        VALUES (?, ?, ?)
-    ''', (user_id, key, value))
-    conn.commit()
-    conn.close()
 
-def get_preferences(user_id: int) -> dict:
-    """Ambil semua preferensi user"""
+def save_preference(user_id: int, key: str, value: str) -> None:
+    """Simpan preferensi user."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        'SELECT key, value FROM preferences WHERE user_id = ?',
-        (user_id,)
+        """
+        INSERT OR REPLACE INTO preferences (user_id, key, value)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_preferences(user_id: int) -> dict[str, str]:
+    """Ambil semua preferensi user."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT key, value FROM preferences WHERE user_id = ?",
+        (user_id,),
     )
     rows = cursor.fetchall()
     conn.close()
     return {row[0]: row[1] for row in rows}
 
-def delete_memory(user_id: int, key: str):
-    """Hapus memory tertentu"""
+
+def delete_memory(user_id: int, key: str) -> None:
+    """Hapus memory tertentu."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        'DELETE FROM long_term_memory WHERE user_id = ? AND key = ?',
-        (user_id, key)
+        "DELETE FROM long_term_memory WHERE user_id = ? AND key = ?",
+        (user_id, key),
     )
     conn.commit()
     conn.close()
 
-def get_all_user_ids() -> list:
-    """Ambil semua user ID yang pernah chat"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT user_id FROM conversations')
-    rows = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in rows]
+
+def get_all_user_ids() -> list[int]:
+    """Daftar user_id unique yang pernah chat. Sekarang lewat sessions store."""
+    return sessions.get_all_user_ids()
+
 
 def get_all_memories_text(user_id: int) -> str:
-    """Tampilkan semua memory dalam format teks"""
+    """Tampilkan semua long-term memory dalam format teks."""
     memories = get_memory(user_id)
-    prefs = get_preferences(user_id)
-
-    if not memories and not prefs:
-        return "Belum ada memory yang tersimpan."
-
-    output = "🧠 Memory lo:\n━━━━━━━━━━━━━━━\n"
-
-    if memories:
-        output += "\n📌 Fakta tentang lo:\n"
-        for key, value in memories.items():
-            output += f"• {key}: {value}\n"
-
-    if prefs:
-        output += "\n⚙️ Preferensi lo:\n"
-        for key, value in prefs.items():
-            output += f"• {key}: {value}\n"
-
-    return output
+    if not memories:
+        return "📭 Belum ada memory tersimpan."
+    text = "🧠 Memory yang gua tau tentang lo:\n\n"
+    for key, value in memories.items():
+        text += f"• {key}: {value}\n"
+    return text
