@@ -25,6 +25,7 @@ from telegram.ext import (
 
 import auth
 import auto_trader
+import sessions as sessions_store
 from agent import execute_approved_command, run_agent
 from config import TELEGRAM_TOKEN
 from logging_setup import configure_logging, get_logger
@@ -87,8 +88,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧠 Inget semua tentang lo\n\n"
         "Commands:\n"
         "/start - Mulai\n"
-        "/clear - Hapus history chat\n"
-        "/memory - Lihat semua memory\n\n"
+        "/clear - Hapus history chat (session aktif)\n"
+        "/memory - Lihat semua memory tersimpan\n"
+        "/sessions - Lihat semua session lo\n"
+        "/search <query> - Full-text search di history\n"
+        "/briefing - Trigger morning briefing\n\n"
         "Ketik, kirim voice note, atau upload file!"
     )
 
@@ -429,6 +433,55 @@ async def manual_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(briefing, parse_mode="Markdown")
 
 
+@require_owner
+async def list_user_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/sessions` — list semua session aktif user."""
+    user_id = update.effective_user.id
+    sess_list = sessions_store.list_sessions(user_id, include_closed=False, limit=20)
+    if not sess_list:
+        await update.message.reply_text("📝 Belum ada session aktif.")
+        return
+    lines = ["📂 Sessions aktif lo:"]
+    for s in sess_list:
+        title = s.title or "(tanpa judul)"
+        count = sessions_store.count_messages(s.id)
+        lines.append(
+            f"• `{s.session_uid}` — {title} — {count} msg — updated {s.updated_at}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@require_owner
+async def search_messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/search <query>` — full-text search di history."""
+    user_id = update.effective_user.id
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text(
+            "Cara pakai: `/search <kata>`\n"
+            "Contoh: `/search bitcoin`\n"
+            "Advanced: `/search btc OR ethereum`",
+            parse_mode="Markdown",
+        )
+        return
+    hits = sessions_store.search_messages(query, user_id=user_id, limit=10)
+    if not hits:
+        await update.message.reply_text(f"🔍 Gak ketemu apa-apa buat `{query}`.", parse_mode="Markdown")
+        return
+    lines = [f"🔍 Hasil search `{query}` ({len(hits)} hit):"]
+    for h in hits:
+        # Strip HTML tags dari snippet biar gak conflict sama markdown.
+        snippet = h.snippet.replace("<b>", "*").replace("</b>", "*")
+        lines.append(
+            f"• [{h.session.session_uid}] _{h.message.role}_ @ {h.message.timestamp}\n  {snippet}"
+        )
+    text = "\n\n".join(lines)
+    # Telegram message limit 4096 chars.
+    if len(text) > 3800:
+        text = text[:3800] + "\n\n…(truncated)"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -466,6 +519,8 @@ def main():
     app.add_handler(CommandHandler("memory", show_memory))
     app.add_handler(CommandHandler("briefing", manual_briefing))
     app.add_handler(CommandHandler("mode", switch_mode))
+    app.add_handler(CommandHandler("sessions", list_user_sessions))
+    app.add_handler(CommandHandler("search", search_messages_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

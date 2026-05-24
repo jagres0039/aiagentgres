@@ -4,9 +4,9 @@ Personal AI Agent berbasis Telegram + Groq AI (Llama 3.3 70B). Terinspirasi
 dari [Hermes Agent](https://hermes-agent.nousresearch.com/) by Nous Research
 (open-source self-improving AI agent — open-claw style).
 
-> **Status:** Phase 0 (security + refactor) — bot udah bisa di-deploy ke
-> production tanpa risiko shell injection. Fitur lanjutan (multi-platform
-> gateway, MCP, delegation) ada di Phase 1+ roadmap.
+> **Status:** Phase 1 PR1 — gateway abstraction + sessions store dengan
+> FTS5 search. Phase 0 (security hardening) sudah merged. Fitur lanjutan
+> (multi-platform, MCP, delegation) ada di Phase 1+ roadmap.
 
 ---
 
@@ -20,7 +20,12 @@ aiagentgres/
 ├── auth.py              # OWNER allow-list + dangerous-cmd approval
 ├── paths.py             # Path resolution (JAGRESMAN_HOME override)
 ├── logging_setup.py     # Logging config
-├── memory.py            # SQLite persistent memory
+├── memory.py            # Thin adapter di atas sessions.py (back-compat)
+├── sessions.py          # Sessions store (FTS5 search) — Hermes-style
+├── gateways/            # Platform abstraction (Telegram + future Discord/Email)
+│   ├── base.py          #   Gateway ABC, IncomingMessage, OutgoingMessage
+│   ├── telegram.py      #   TelegramGateway impl
+│   └── stub.py          #   In-memory gateway buat testing
 ├── skill_loader.py      # Load skills dari folder skills/
 ├── skill_executor.py    # Eksekusi kode dari skill
 ├── skill_writer.py      # Self-improving — nulis skill sendiri via LLM
@@ -37,7 +42,9 @@ aiagentgres/
 ├── .gitignore           # Hardening biar gak commit secret lagi
 ├── tests/               # Pytest test suite
 │   ├── test_smoke.py
-│   └── test_auth.py
+│   ├── test_auth.py
+│   ├── test_sessions.py
+│   └── test_gateway.py
 └── .github/workflows/   # GitHub Actions CI (ruff + pytest)
 ```
 
@@ -114,6 +121,49 @@ nge-approve command yang di-trigger user A.
 `EDIT_FILE` di-disable sementara di Phase 0 sampai approval flow buat
 file-write selesai (Phase 1).
 
+---
+
+## 🧠 Sessions & Search (Phase 1 PR1)
+
+Memory schema lama (single `conversations` table) di-replace sama dua tabel:
+
+- **`sessions`** — metadata: `session_uid`, `user_id`, `platform`, `title`,
+  `summary`, `created_at`, `updated_at`, `closed`. Tiap percakapan = satu
+  session, bisa di-resume, di-close, di-list.
+- **`messages`** — full log: `session_id`, `role`, `content`, `metadata`
+  (JSON), `timestamp`. Plus FTS5 virtual table `messages_fts` buat
+  pencarian full-text instan.
+
+Migration: kalau lo upgrade dari Phase 0, tabel `conversations` lama
+diambil otomatis pas pertama kali jalan — semua message di-import ke
+session "Migrated from Phase 0" per user. Tabel lamanya dibiarin
+read-only (gak di-drop) biar destructive op-nya manual.
+
+Search pakai `/search <query>`:
+- Single word: `/search bitcoin` → prefix match (`bitcoin*`)
+- Multi word: `/search btc trading` → AND match
+- Advanced: `/search btc OR eth NOT meme` → operator FTS5
+
+API programmatic (lihat `sessions.py`):
+```python
+import sessions
+
+s = sessions.get_or_create_active_session(user_id=42)
+sessions.append_message(s.id, "user", "halo")
+hits = sessions.search_messages("halo", user_id=42)
+```
+
+## 🌐 Gateway Abstraction (Phase 1 PR1)
+
+`gateways/` package memisahin platform messaging dari core agent. Tujuan:
+nanti tambah Discord/Email/Slack tinggal bikin `gateways/<nama>.py` yang
+inherit `Gateway` ABC. Agent core gak peduli platform-nya apa — dia cuma
+consume `IncomingMessage` dan emit `OutgoingMessage`.
+
+Status sekarang: `TelegramGateway` udah punya `send()` functional, tapi
+inbound handler registration masih lewat `main.py` legacy. Migrasi
+lengkap di Phase 1 PR berikutnya.
+
 ### File hygiene
 `.env`, `*.db`, `*.log`, `service_account.json`, `playwright_cookies.json`,
 `tmp_*.py`, `__pycache__/` semua di-ignore dari git. Kalau lo upgrade dari
@@ -140,8 +190,10 @@ CI otomatis jalanin keduanya di GitHub Actions tiap push & PR (`.github/workflow
 ### Commands
 ```
 /start    - Halo
-/clear    - Hapus history chat
+/clear    - Hapus history chat (session aktif)
 /memory   - Lihat semua memory tersimpan
+/sessions - List session aktif lo
+/search <query> - Full-text search di history (FTS5)
 /briefing - Trigger morning briefing manual
 /mode     - Switch trading mode (scalping / swing)
 ```
@@ -176,16 +228,21 @@ Voice note → bot transcribe (Whisper) & proses.
 - [x] GitHub Actions CI (ruff + pytest)
 - [x] Smoke tests + auth tests
 
-### 🔧 Phase 1 — Core Hermes parity (next)
-- [ ] Gateway abstraction (Telegram + Discord + Email skeleton)
-- [ ] Sessions (resumable, FTS5 search)
-- [ ] Profiles (switch persona on the fly)
-- [ ] Natural-language cron (replace hardcoded scheduler)
-- [ ] Structured action dispatcher (replace string parsing)
-- [ ] Skill curator + auto-improve
-- [ ] Provider abstraction (Groq / OpenAI / Anthropic / Ollama)
-- [ ] Browser tool refactor (drop inline subprocess script string)
-- [ ] EDIT_FILE re-enabled dengan approval flow
+### 🔧 Phase 1 — Core Hermes parity
+- [x] **PR1: Gateway abstraction + Sessions** (current)
+  - [x] `Gateway` ABC + `IncomingMessage`/`OutgoingMessage` dataclasses
+  - [x] `TelegramGateway` skeleton dengan outbound `send()` functional
+  - [x] `StubGateway` buat testing
+  - [x] Sessions store dengan FTS5 search
+  - [x] `/sessions` + `/search` commands
+  - [x] Auto-migrate legacy `conversations` table ke sessions
+- [ ] PR2: Profile system + AGENTS.md/SOUL.md auto-load + persona switching
+- [ ] PR3: Natural-language cron (replace hardcoded `JobQueue`)
+- [ ] PR4: Structured action dispatcher (replace LLM string parsing)
+- [ ] PR5: Provider abstraction (Groq / OpenAI / Anthropic / Ollama)
+- [ ] PR6: Skill curator + auto-improve
+- [ ] PR7: Discord + Email gateway impl beneran
+- [ ] PR8: EDIT_FILE re-enabled dengan approval flow
 
 ### ⚡ Phase 2 — Power features
 - [ ] Delegation / subagents (parallel isolated work)
