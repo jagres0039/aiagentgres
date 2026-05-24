@@ -1,8 +1,9 @@
-import requests
-import pandas as pd
-import numpy as np
 import time
 from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+
 
 # --- STEP 1: DATA FETCHER (6 BULAN) ---
 def get_multi_data(symbols):
@@ -29,7 +30,6 @@ def get_multi_data(symbols):
 # --- STEP 2: LOGIKA BACKTEST V42 (HYBRID SNIPER) ---
 def run_backtest_v42(all_data):
     all_trades = []
-    risk_per_trade = 50
     active_trades = {}
 
     for symbol in all_data:
@@ -47,7 +47,7 @@ def run_backtest_v42(all_data):
         for symbol in all_data:
             df = all_data[symbol]
             curr = df.iloc[i]
-            
+
             if symbol in active_trades:
                 t = active_trades[symbol]
                 if t['type'] == 'LONG':
@@ -66,7 +66,7 @@ def run_backtest_v42(all_data):
                     sl = entry - (curr['atr'] * 2.5)
                     tp = entry + (abs(entry - sl) * 1.0) # RR 1:1
                     active_trades[symbol] = {'symbol': symbol, 'type': 'LONG', 'entry': entry, 'sl': sl, 'tp': tp, 'time': curr['datetime'], 'result': None}
-            
+
             # SHORT: Trend DOWN + RSI > 55 + Volume Spike + Candle Merah
             elif curr['c'] < curr['ema_anchor'] and curr['rsi'] > 55:
                 if curr['v'] > curr['vol_ma'] and curr['c'] < curr['o']:

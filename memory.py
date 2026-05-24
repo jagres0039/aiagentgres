@@ -1,14 +1,13 @@
 import sqlite3
-import json
-import os
-from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'memory.db')
+from paths import DB_PATH as _DB_PATH
+
+DB_PATH = str(_DB_PATH)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
     # Tabel conversation history
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS conversations (
@@ -19,7 +18,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     # Tabel long term memory (fakta tentang user)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS long_term_memory (
@@ -31,7 +30,7 @@ def init_db():
             UNIQUE(user_id, key)
         )
     ''')
-    
+
     # Tabel user preferences
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS preferences (
@@ -42,7 +41,7 @@ def init_db():
             UNIQUE(user_id, key)
         )
     ''')
-    
+
     conn.commit()
     conn.close()
 
@@ -54,40 +53,40 @@ MAX_HISTORY = 20
 def add_message(user_id: int, role: str, content: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
     cursor.execute(
         'INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)',
         (user_id, role, content)
     )
-    
+
     # Hapus history lama kalau udah lebih dari MAX_HISTORY
     cursor.execute('''
-        DELETE FROM conversations 
+        DELETE FROM conversations
         WHERE user_id = ? AND id NOT IN (
-            SELECT id FROM conversations 
-            WHERE user_id = ? 
-            ORDER BY id DESC 
+            SELECT id FROM conversations
+            WHERE user_id = ?
+            ORDER BY id DESC
             LIMIT ?
         )
     ''', (user_id, user_id, MAX_HISTORY))
-    
+
     conn.commit()
     conn.close()
 
 def get_history(user_id: int) -> list:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
     cursor.execute('''
-        SELECT role, content FROM conversations 
-        WHERE user_id = ? 
-        ORDER BY id DESC 
+        SELECT role, content FROM conversations
+        WHERE user_id = ?
+        ORDER BY id DESC
         LIMIT ?
     ''', (user_id, MAX_HISTORY))
-    
+
     rows = cursor.fetchall()
     conn.close()
-    
+
     # Balik urutan biar chronological
     return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
 
@@ -126,7 +125,7 @@ def get_memory_prompt(user_id: int) -> str:
     memories = get_memory(user_id)
     if not memories:
         return ""
-    
+
     prompt = "Yang lo tau tentang user ini:\n"
     for key, value in memories.items():
         prompt += f"- {key}: {value}\n"

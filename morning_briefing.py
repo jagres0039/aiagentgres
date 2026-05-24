@@ -1,9 +1,10 @@
-import asyncio
-from datetime import datetime
-from tools.search_tool import web_search, search_news
-from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+from groq import Groq
+from tools.search_tool import web_search
+
+from config import GROQ_API_KEY, GROQ_MODEL
 
 client = Groq(api_key=GROQ_API_KEY)
 

@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify
-import asyncio
 import os
+
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 

@@ -1,8 +1,10 @@
-import subprocess
 import os
+import subprocess
 import tempfile
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
+from paths import SKILLS_DIR as _SKILLS_DIR
+
+SKILLS_DIR = str(_SKILLS_DIR)
 
 def execute_skill(skill_name: str, code: str) -> str:
     try:

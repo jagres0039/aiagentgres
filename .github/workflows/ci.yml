@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Hanya install yang dibutuhkan ruff + pytest + module-module yang di-test
+          # (auth, paths, logging_setup, config, memory).
+          # Skip dependency berat (groq, telegram-bot, playwright, binance) yang gak
+          # disentuh smoke test, biar CI tetep cepet.
+          pip install ruff pytest pytest-asyncio python-dotenv
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest -ra

@@ -1,7 +1,8 @@
 import os
-import re
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
+from paths import SKILLS_DIR as _SKILLS_DIR
+
+SKILLS_DIR = str(_SKILLS_DIR)
 
 def parse_skill_md(content: str) -> dict:
     """Parse SKILL.md dengan YAML frontmatter"""
@@ -81,7 +82,7 @@ def load_all_skills() -> list:
 
 def match_skill(user_message: str) -> str:
     """Cari skill yang paling cocok dengan request user"""
-    
+
     # Exclude keyword yang bukan skill
     non_skill_keywords = [
         'buat excel', 'bikin excel', 'create excel',
@@ -92,12 +93,12 @@ def match_skill(user_message: str) -> str:
         'buat skill', 'hapus skill', 'improve skill',
         'cariin', 'cari info', 'berita'
     ]
-    
+
     user_lower = user_message.lower()
     for kw in non_skill_keywords:
         if kw in user_lower:
             return None
-    
+
     skills = load_all_skills()
 
     best_match = None

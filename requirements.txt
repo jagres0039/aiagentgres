@@ -1,0 +1,34 @@
+# =============================================================
+# Generated for aiagentgres. Source of truth: pyproject.toml.
+# Pinned major versions; let pip resolve minors.
+# Install: pip install -r requirements.txt
+# =============================================================
+
+python-telegram-bot>=20.7,<22
+groq>=0.11.0
+python-dotenv>=1.0.0
+apscheduler>=3.10.4
+pytz>=2024.1
+
+# Tools
+tavily-python>=0.5.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.130.0
+requests>=2.32.0
+
+# Data
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Trading
+python-binance>=1.0.19
+vaderSentiment>=3.3.2
+
+# File parsing
+pymupdf>=1.24.0
+python-docx>=1.1.0
+openpyxl>=3.1.2
+
+# Async
+aiosqlite>=0.20.0

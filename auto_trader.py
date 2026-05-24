@@ -1,15 +1,20 @@
-import sys
-sys.path.insert(0, '/root/aiagent')
 import os
+import sys
 import time
-import requests
-import pandas as pd
+from pathlib import Path
+
+# Make sibling modules importable. JAGRESMAN_HOME overrides default.
+_BASE_DIR = os.getenv("JAGRESMAN_HOME") or str(Path(__file__).resolve().parent)
+sys.path.insert(0, _BASE_DIR)
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
+
+import pandas as pd
+import requests
 from dotenv import load_dotenv
 
-load_dotenv('/root/aiagent/.env')
+load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 # ==========================================
 # CONFIG UTAMA
@@ -248,8 +253,8 @@ def detect_bos(df):
     rh = max(df['h'].values[-20:-1])
     rl = min(df['l'].values[-20:-1])
     bos = "None"
-    if curr['c'] > rh: bos = f"BULLISH Break"
-    elif curr['c'] < rl: bos = f"BEARISH Break"
+    if curr['c'] > rh: bos = "BULLISH Break"
+    elif curr['c'] < rl: bos = "BEARISH Break"
     return bos, rh, rl
 
 # ==========================================
@@ -382,10 +387,10 @@ def analyze_signal(symbol: str) -> dict:
 def monitor_trailing_sl():
     """Monitor posisi terbuka dan trailing SL"""
     try:
-        from tools.binance_trader import get_open_positions
         from binance.client import Client
         from dotenv import load_dotenv
-        load_dotenv('/root/aiagent/.env')
+        from tools.binance_trader import get_open_positions
+        load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
         client = Client(
             os.getenv("BINANCE_API_KEY"),
@@ -400,7 +405,7 @@ def monitor_trailing_sl():
             symbol = pos['symbol']
             side = pos['side']
             entry = pos['entry']
-            pnl = pos['pnl']
+            pos['pnl']
 
             current_price = get_current_price(symbol)
             if current_price == 0:
